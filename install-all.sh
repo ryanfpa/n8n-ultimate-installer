@@ -1,449 +1,209 @@
-#!/usr/bin/env bash
-#
-# n8n ULTIMATE INSTALLER - Ryan F.P.A (Host-level Auto Edition)
-# -------------------------------------------------------------
-# Mục tiêu:
-# - 1 lệnh duy nhất: cài, cấu hình, tự vận hành như n8n host.
-# - BẮT BUỘC: DOMAIN + (Cloudflare Named Tunnel token HOẶC Quick Tunnel).
-# - Docker + Postgres, dữ liệu /opt/n8n.
-# - Tự tạo:
-#     - n8n-status / n8n-backup / n8n-update / n8n-health
-#     - cron backup định kỳ
-#     - cron health-check (tự restart nếu chết)
-# - Idempotent: chạy lại không phá DB, không nhân cron, không ghi đè config.
-#
-# Cách dùng:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/ryanfpa/n8n-ultimate-installer/main/install-all.sh)
-#
+#!/bin/bash
+# ====================================================================
+# N8N VIP PRO - CLOUDFLARE TUNNEL - FINAL SAFE EDITION
+# ====================================================================
 
-set -euo pipefail
+set -e
 
-### CONFIG CỐ ĐỊNH #####################################################
+# 1. Root check
+if [[ $EUID -ne 0 ]]; then
+  echo "❌ This script must be run as root. Use: sudo $0"
+  exit 1
+fi
 
-N8N_DIR="/opt/n8n"
-N8N_IMAGE="n8nio/n8n:latest"
-POSTGRES_IMAGE="postgres:16-alpine"
-N8N_PORT="5678"
-N8N_TIMEZONE="Asia/Ho_Chi_Minh"
+# 2. Nhập thông tin
+read -p "🌐 Public domain cho N8N (ví dụ: n8mini.h2d.site): " DOMAIN
+read -p "🔑 Cloudflare TUNNEL_TOKEN: " CF_TUNNEL_TOKEN
 
-CF_SERVICE_NAME="cloudflared-n8n"
-BIN_DIR="/usr/local/bin"
-CRON_FILE="/etc/cron.d/n8n-maintenance"
+if [[ -z "$DOMAIN" || -z "$CF_TUNNEL_TOKEN" ]]; then
+  echo "❌ Domain và Tunnel Token không được để trống."
+  exit 1
+fi
 
-### LOG ###############################################################
+START_TIME=$(date +%s)
 
-log()  { echo -e "\e[32m[OK]\e[0m $*"; }
-info() { echo -e "\e[34m[INFO]\e[0m $*"; }
-warn() { echo -e "\e[33m[WARN]\e[0m $*"; }
-err()  { echo -e "\e[31m[ERR]\e[0m $*" >&2; }
+# 3. Thư mục
+N8N_DIR="/home/n8n"
+DATA_DIR="$N8N_DIR/data"
+SCRIPTS_DIR="$N8N_DIR/scripts"
+LOGS_DIR="$N8N_DIR/logs"
+BACKUP_DIR="$N8N_DIR/backups"
 
-### CHECKS ############################################################
+mkdir -p "$DATA_DIR" "$SCRIPTS_DIR" "$LOGS_DIR" "$BACKUP_DIR"
 
-require_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    err "Vui lòng chạy với sudo/root."
-    exit 1
-  fi
-}
+# 4. Cài Docker nếu chưa có
+echo "🐳 Checking / installing Docker..."
+if ! command -v docker &>/dev/null; then
+  apt-get update -qq
+  apt-get install -y -qq ca-certificates curl gnupg lsb-release
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+    https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update -qq
+  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  systemctl enable docker
+  systemctl start docker
+fi
+echo "✅ Docker ready."
 
-check_os() {
-  if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    if [ "${ID:-}" != "ubuntu" ]; then
-      warn "Script tối ưu cho Ubuntu. Hiện tại: ${ID:-unknown}"
-    fi
-  fi
-}
-
-run_apt() {
-  info "apt-get update..."
-  apt-get update -y -qq
-}
-
-install_base_packages() {
-  info "Cài Docker & tools cần thiết..."
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    ca-certificates curl gnupg lsb-release jq \
-    docker.io docker-compose-plugin || {
-      err "Cài package thất bại."
-      exit 1
-    }
-
-  systemctl enable --now docker >/dev/null 2>&1 || true
-
-  command -v docker >/dev/null 2>&1 || { err "Docker chưa chạy."; exit 1; }
-  docker compose version >/dev/null 2>&1 || { err "docker compose plugin chưa có."; exit 1; }
-
-  log "Docker & docker compose OK."
-}
-
-install_cloudflared() {
-  if command -v cloudflared >/dev/null 2>&1; then
-    log "cloudflared đã có."
-    return
-  fi
-
-  info "Cài cloudflared..."
-  local TMP_DEB="/tmp/cloudflared.deb"
-  curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb" -o "$TMP_DEB"
-  dpkg -i "$TMP_DEB" >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq
-  rm -f "$TMP_DEB"
-
-  command -v cloudflared >/dev/null 2>&1 || { err "Không cài được cloudflared."; exit 1; }
-  log "cloudflared OK."
-}
-
-### INPUT: DOMAIN + CHẾ ĐỘ TUNNEL #####################################
-
-prompt_domain_and_tunnel_mode() {
-  local EXIST_ENV="${N8N_DIR}/.env"
-  local PRESET_DOMAIN=""
-
-  if [ -f "$EXIST_ENV" ]; then
-    PRESET_DOMAIN=$(grep -E '^N8N_HOST=' "$EXIST_ENV" | cut -d'=' -f2- || true)
-  fi
-
-  if [ -n "$PRESET_DOMAIN" ]; then
-    info "Phát hiện DOMAIN từ .env: $PRESET_DOMAIN"
-    DOMAIN="$PRESET_DOMAIN"
-  else
-    read -rp "Nhập DOMAIN cho n8n (vd: n8n.ryanfpa.com): " DOMAIN || true
-  fi
-
-  if [ -z "${DOMAIN:-}" ]; then
-    err "DOMAIN là bắt buộc để quản lý mọi nơi bằng 1 link."
-    exit 1
-  fi
-
-  echo
-  echo "Chọn chế độ Cloudflare Tunnel:"
-  echo "  1) Named Tunnel (Token)  - ổn định, dùng cho domain chính (khuyên dùng)"
-  echo "  2) Quick Tunnel fallback - nếu chưa có token, script tự tạo link .trycloudflare.com"
-  read -rp "Chọn [1/2] (mặc định: 1): " CF_MODE || true
-  CF_MODE="${CF_MODE:-1}"
-
-  if [ "$CF_MODE" = "1" ]; then
-    if systemctl list-unit-files | grep -q "^${CF_SERVICE_NAME}.service"; then
-      info "Đã có service Tunnel, giữ token & cấu hình cũ."
-      CF_TUNNEL_TOKEN=""
-      return
-    fi
-
-    read -rp "Nhập Cloudflare Tunnel Token (Named Tunnel) cho DOMAIN này: " CF_TUNNEL_TOKEN || true
-    if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
-      err "Chọn mode 1 thì TOKEN là bắt buộc."
-      exit 1
-    fi
-  else
-    CF_TUNNEL_TOKEN=""
-  fi
-}
-
-### N8N CORE FILES ####################################################
-
-ensure_dirs() {
-  mkdir -p "${N8N_DIR}"/{n8n_data,postgres_data,backups,scripts}
-  log "Thư mục ${N8N_DIR} OK."
-}
-
-create_env_file() {
-  local ENV_FILE="${N8N_DIR}/.env"
-
-  if [ -f "$ENV_FILE" ]; then
-    log ".env đã có, không ghi đè."
-    return
-  fi
-
-  cat > "$ENV_FILE" <<EOF
-N8N_HOST=${DOMAIN}
-N8N_PORT=${N8N_PORT}
-N8N_PROTOCOL=https
-N8N_EDITOR_BASE_URL=https://${DOMAIN}
-WEBHOOK_URL=https://${DOMAIN}
-
-DB_TYPE=postgresdb
-DB_POSTGRESDB_HOST=db
-DB_POSTGRESDB_PORT=5432
-DB_POSTGRESDB_DATABASE=n8n
-DB_POSTGRESDB_USER=n8n
-DB_POSTGRESDB_PASSWORD=n8npassword
-
-GENERIC_TIMEZONE=${N8N_TIMEZONE}
-EOF
-
-  log "Đã tạo .env với DOMAIN=${DOMAIN}."
-}
-
-create_docker_compose() {
-  local DC_FILE="${N8N_DIR}/docker-compose.yml"
-
-  if [ -f "$DC_FILE" ]; then
-    log "docker-compose.yml đã có, không ghi đè."
-    return
-  fi
-
-  cat > "$DC_FILE" <<EOF
+# 5. docker-compose.yml (n8n + cloudflared)
+cat > "$N8N_DIR/docker-compose.yml" <<EOF
 version: "3.8"
 
 services:
-  db:
-    image: ${POSTGRES_IMAGE}
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
     restart: unless-stopped
     environment:
-      - POSTGRES_USER=n8n
-      - POSTGRES_PASSWORD=n8npassword
-      - POSTGRES_DB=n8n
+      - N8N_HOST=${DOMAIN}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://${DOMAIN}/
+      - NODE_ENV=production
+      - GENERIC_TIMEZONE=Asia/Ho_Chi_Minh
+      - TZ=Asia/Ho_Chi_Minh
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_PERSONALIZATION_ENABLED=false
     volumes:
-      - ./postgres_data:/var/lib/postgresql/data
+      - ./data:/home/node/.n8n
+    networks:
+      - n8n_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
 
-  n8n:
-    image: ${N8N_IMAGE}
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
     restart: unless-stopped
-    env_file:
-      - .env
+    command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}
     depends_on:
-      - db
-    ports:
-      - "127.0.0.1:${N8N_PORT}:${N8N_PORT}"
-    volumes:
-      - ./n8n_data:/home/node/.n8n
+      - n8n
+    networks:
+      - n8n_net
+
+networks:
+  n8n_net:
+    driver: bridge
 EOF
 
-  log "Đã tạo docker-compose.yml."
-}
+# 6. Quyền thư mục (user 1000 trong container n8n)
+chown -R 1000:1000 "$DATA_DIR"
+chmod -R 755 "$N8N_DIR"
 
-start_n8n_stack() {
-  info "Khởi động n8n stack..."
-  (cd "$N8N_DIR" && docker compose pull && docker compose up -d)
-  log "n8n stack đang chạy."
-}
+# 7. Systemd service để auto start
+cat > /etc/systemd/system/n8n.service <<EOF
+[Unit]
+Description=N8N + Cloudflare Tunnel (Docker)
+Requires=docker.service
+After=docker.service
 
-### HELPER SCRIPTS (STATUS / BACKUP / UPDATE / HEALTH) ################
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${N8N_DIR}
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=60
+TimeoutStopSec=60
 
-create_helper_scripts() {
-  local SCRIPTS_DIR="${N8N_DIR}/scripts"
-
-  # n8n-status
-  cat > "${SCRIPTS_DIR}/n8n-status.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-cd /opt/n8n
-echo "== n8n / db containers =="
-docker compose ps || true
-echo
-echo "== Disk usage =="
-du -sh n8n_data postgres_data 2>/dev/null || true
+[Install]
+WantedBy=multi-user.target
 EOF
-  chmod +x "${SCRIPTS_DIR}/n8n-status.sh"
 
-  # n8n-backup
-  cat > "${SCRIPTS_DIR}/n8n-backup.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-cd /opt/n8n
-TS=$(date +"%Y%m%d-%H%M%S")
-mkdir -p backups
-tar -czf "backups/n8n-backup-${TS}.tar.gz" n8n_data postgres_data .env docker-compose.yml
-echo "[OK] Backup: backups/n8n-backup-${TS}.tar.gz"
+systemctl daemon-reload
+systemctl enable n8n.service
+
+# 8. backup.sh
+cat > "$SCRIPTS_DIR/backup.sh" <<'EOF'
+#!/bin/bash
+BACKUP_DIR="/home/n8n/backups"
+mkdir -p "$BACKUP_DIR"
+FILE="$BACKUP_DIR/n8n_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+tar -czf "$FILE" -C /home/n8n data
+ls -t $BACKUP_DIR/n8n_backup_*.tar.gz | tail -n +8 | xargs -r rm
+echo "✅ Backup created: $FILE"
 EOF
-  chmod +x "${SCRIPTS_DIR}/n8n-backup.sh"
+chmod +x "$SCRIPTS_DIR/backup.sh"
 
-  # n8n-update (manual, không auto)
-  cat > "${SCRIPTS_DIR}/n8n-update.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-cd /opt/n8n
-TS=$(date +"%Y%m%d-%H%M%S")
-mkdir -p backups
-echo "[INFO] Backup trước update..."
-tar -czf "backups/backup-before-update-${TS}.tar.gz" n8n_data postgres_data .env docker-compose.yml 2>/dev/null || true
-echo "[INFO] Pull image mới & restart..."
-docker compose pull
-docker compose up -d
-docker compose ps
+# 9. update-n8n.sh (CHỈ update n8n)
+cat > "$SCRIPTS_DIR/update-n8n.sh" <<'EOF'
+#!/bin/bash
+cd /home/n8n || exit 1
+echo "📦 Pulling latest n8n image..."
+docker pull n8nio/n8n:latest
+echo "🧹 Cleaning unused images..."
+docker image prune -f > /dev/null
+echo "🔄 Restarting only n8n container..."
+docker compose stop n8n
+docker compose rm -f n8n
+docker compose up -d n8n
+echo "✅ n8n updated successfully."
 EOF
-  chmod +x "${SCRIPTS_DIR}/n8n-update.sh"
+chmod +x "$SCRIPTS_DIR/update-n8n.sh"
 
-  # n8n-health (tự kiểm tra & tự sửa)
-  cat > "${SCRIPTS_DIR}/n8n-health.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-cd /opt/n8n
-
-# Check containers
-if ! docker compose ps >/dev/null 2>&1; then
-  echo "[WARN] docker compose lỗi, thử restart stack..."
-  docker compose up -d || exit 1
-  exit 0
-fi
-
-DB_STATUS=$(docker compose ps db 2>/dev/null | awk 'NR==3{print $4}' || true)
-N8N_STATUS=$(docker compose ps n8n 2>/dev/null | awk 'NR==3{print $4}' || true)
-
-if [[ "$DB_STATUS" != "Up"* ]]; then
-  echo "[WARN] db không up. Restart..."
-  docker compose up -d db
-fi
-
-if [[ "$N8N_STATUS" != "Up"* ]]; then
-  echo "[WARN] n8n không up. Restart..."
+# 10. health-check.sh (tự bật lại nếu container chết)
+cat > "$SCRIPTS_DIR/health-check.sh" <<'EOF'
+#!/bin/bash
+cd /home/n8n || exit 0
+if ! docker ps | grep -q "n8n"; then
+  echo "⚠️  n8n not running, restarting..."
   docker compose up -d n8n
-  exit 0
 fi
-
-# HTTP check
-STATUS_CODE=$(curl -sk -o /dev/null -w "%{http_code}" http://127.0.0.1:5678 || echo "000")
-if [ "$STATUS_CODE" != "200" ] && [ "$STATUS_CODE" != "301" ] && [ "$STATUS_CODE" != "302" ]; then
-  echo "[WARN] n8n HTTP ${STATUS_CODE}, restart service..."
-  docker compose restart n8n || true
-else
-  echo "[OK] n8n healthy (${STATUS_CODE})."
+if ! docker ps | grep -q "cloudflared"; then
+  echo "⚠️  cloudflared not running, restarting..."
+  docker compose up -d cloudflared
 fi
 EOF
-  chmod +x "${SCRIPTS_DIR}/n8n-health.sh"
+chmod +x "$SCRIPTS_DIR/health-check.sh"
 
-  # symlink global
-  ln -sf "${SCRIPTS_DIR}/n8n-status.sh"  "${BIN_DIR}/n8n-status"
-  ln -sf "${SCRIPTS_DIR}/n8n-backup.sh"  "${BIN_DIR}/n8n-backup"
-  ln -sf "${SCRIPTS_DIR}/n8n-update.sh"  "${BIN_DIR}/n8n-update"
-  ln -sf "${SCRIPTS_DIR}/n8n-health.sh"  "${BIN_DIR}/n8n-health"
+# 11. Alias tiện dụng
+if ! grep -q "n8nupdate" /root/.bashrc 2>/dev/null; then
+cat >> /root/.bashrc <<'EOF'
 
-  log "Đã tạo: n8n-status, n8n-backup, n8n-update, n8n-health."
-}
-
-### CRON TỰ ĐỘNG (BACKUP + HEALTH) ####################################
-
-setup_cron_jobs() {
-  info "Thiết lập cron tự động (health-check + backup)..."
-
-  # Ghi đè file cron riêng cho n8n (idempotent)
-  cat > "$CRON_FILE" <<EOF
-# n8n auto maintenance - Ryan F.P.A
-# Health-check mỗi 5 phút
-*/5 * * * * root /usr/local/bin/n8n-health >/var/log/n8n-health.log 2>&1
-
-# Backup full mỗi ngày lúc 03:00
-0 3 * * * root /usr/local/bin/n8n-backup >/var/log/n8n-backup.log 2>&1
+# N8N helpers
+alias n8nupdate='/home/n8n/scripts/update-n8n.sh'
+alias n8nbackup='/home/n8n/scripts/backup.sh'
+alias n8nlogs='cd /home/n8n && docker compose logs -f n8n'
 EOF
+fi
 
-  chmod 644 "$CRON_FILE"
-  log "Cron maintenance đã cấu hình."
-}
+# 12. Cron: backup 6h/lần + health-check 5 phút/lần
+( crontab -l 2>/dev/null; \
+  echo "0 */6 * * * /home/n8n/scripts/backup.sh >/home/n8n/logs/backup.log 2>&1"; \
+  echo "*/5 * * * * /home/n8n/scripts/health-check.sh >/home/n8n/logs/health.log 2>&1" \
+) | crontab -
 
-### CLOUDFLARE TUNNEL (NAMED / QUICK) #################################
+# 13. Khởi động stack lần đầu
+cd "$N8N_DIR"
+echo "🚀 Starting N8N + Cloudflare Tunnel..."
+docker compose up -d
 
-setup_cloudflare_tunnel_service() {
-  # Nếu đã có service (Named Tunnel cũ), giữ nguyên.
-  if systemctl list-unit-files | grep -q "^${CF_SERVICE_NAME}.service"; then
-    log "Service ${CF_SERVICE_NAME} đã tồn tại, không thay đổi."
-    systemctl enable --now "${CF_SERVICE_NAME}.service" || true
-    return
-  fi
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
 
-  if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
-    # Named Tunnel
-    cat > "/etc/systemd/system/${CF_SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=Cloudflare Named Tunnel for n8n (${DOMAIN})
-After=network-online.target docker.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable --now "${CF_SERVICE_NAME}.service"
-    log "Đã bật Named Tunnel cho ${DOMAIN}."
-  else
-    # Quick Tunnel fallback: không cố định domain, nhưng auto tạo link
-    cat > "/etc/systemd/system/${CF_SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=Cloudflare Quick Tunnel for n8n (auto .trycloudflare.com)
-After=network-online.target docker.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:${N8N_PORT}
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable --now "${CF_SERVICE_NAME}.service"
-    log "Đã bật Quick Tunnel (xem URL trong: journalctl -u ${CF_SERVICE_NAME}.service | grep 'https://')."
-  fi
-}
-
-### SUMMARY ###########################################################
-
-print_summary() {
-  echo
-  echo "================================================"
-  echo " ✅ n8n HOST AUTO EDITION - HOÀN TẤT"
-  echo "================================================"
-  echo "- Folder chính : ${N8N_DIR}"
-  echo "- n8n data     : ${N8N_DIR}/n8n_data"
-  echo "- Postgres data: ${N8N_DIR}/postgres_data"
-  echo "- Backups      : ${N8N_DIR}/backups"
-  echo
-  echo "- Lệnh hữu ích:"
-  echo "    n8n-status  -> xem trạng thái"
-  echo "    n8n-backup  -> backup thủ công"
-  echo "    n8n-update  -> backup + pull image mới (manual)"
-  echo "    n8n-health  -> chạy health-check thủ công"
-  echo
-  echo "- Tự động:"
-  echo "    Health-check mỗi 5 phút (cron)"
-  echo "    Backup mỗi ngày lúc 03:00 (cron)"
-  echo
-  if systemctl is-active --quiet "${CF_SERVICE_NAME}.service"; then
-    echo "- Cloudflare Tunnel service đang chạy: ${CF_SERVICE_NAME}"
-    if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
-      echo "  Mode: Named Tunnel → dùng https://${DOMAIN} ở mọi nơi."
-    else
-      echo "  Mode: Quick Tunnel → xem URL bằng:"
-      echo "        journalctl -u ${CF_SERVICE_NAME}.service | grep 'https://'"
-    fi
-  else
-    echo "- Cloudflare Tunnel: chưa chạy (kiểm tra service/log)."
-  fi
-  echo
-  echo "🔁 Chạy lại cùng lệnh cài đặt bất cứ lúc nào:"
-  echo "- Đảm bảo stack chạy lại, cron giữ nguyên, data an toàn."
-  echo "================================================"
-}
-
-### MAIN ##############################################################
-
-main() {
-  echo "================================================"
-  echo "   n8n ULTIMATE INSTALLER - Ryan F.P.A"
-  echo "   (Host-level Auto Edition)"
-  echo "================================================"
-
-  require_root
-  check_os
-  run_apt
-  install_base_packages
-  install_cloudflared
-  prompt_domain_and_tunnel_mode
-  ensure_dirs
-  create_env_file
-  create_docker_compose
-  start_n8n_stack
-  create_helper_scripts
-  setup_cron_jobs
-  setup_cloudflare_tunnel_service
-  print_summary
-}
-
-main "$@"
+echo ""
+echo "╔══════════════════════════════════════════════════════╗"
+echo "║           ✅ N8N INSTALLATION COMPLETED              ║"
+echo "╠══════════════════════════════════════════════════════╣"
+echo "║  🌐 Public URL (qua Cloudflare Tunnel): https://${DOMAIN}"
+echo "║  📂 Data dir:      /home/n8n/data"
+echo "║  🔁 Auto start:    systemctl status n8n"
+echo "║  💾 Backup now:    n8nbackup"
+echo "║  🔧 Update n8n:    n8nupdate  (ONLY n8n image)"
+echo "╚══════════════════════════════════════════════════════╝"
+echo ""
+echo "👉 Trong Cloudflare Zero Trust:"
+echo "   - Đảm bảo Tunnel dùng đúng TUNNEL_TOKEN này đang chạy."
+echo "   - Tạo Application Route:"
+echo "       Hostname: ${DOMAIN}"
+echo "       Service:  http://n8n:5678"
+echo ""
